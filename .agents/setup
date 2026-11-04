@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# Amp orb setup (https://ampcode.com/docs/orbs): the Lean toolchain, every project's Lake
+# dependencies with Mathlib's prebuilt cache, and the Rust toolchain and leanVM checkout that
+# `./check-all.sh vectors` needs. No proof is built here: a build takes CPU-hours (README.md).
+# Idempotent; a warm run only checks what is already installed.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+root="$PWD"
+
+step() { printf '\n==> %s\n' "$*"; step_start=$SECONDS; }
+done_step() { printf '    (%ds)\n' "$((SECONDS - step_start))"; }
+
+step "elan and the Lean toolchain"
+if [ ! -x "$HOME/.elan/bin/elan" ]; then
+  curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+    | sh -s -- -y --default-toolchain none --no-modify-path
+fi
+export PATH="$HOME/.elan/bin:$PATH"
+toolchain="$(tr -d '[:space:]' < lean-toolchain)"
+elan toolchain install "$toolchain"
+elan default "$toolchain"
+done_step
+
+step "rustup and stable Rust (leanVM's Rust: ./check-all.sh vectors)"
+if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
+  curl -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path
+fi
+export PATH="$HOME/.cargo/bin:$PATH"
+done_step
+
+step "PATH for login shells"
+profile_marker="# leanerVM: elan and cargo"
+if ! grep -Fqx "$profile_marker" "$HOME/.bash_profile" 2>/dev/null; then
+  cat >> "$HOME/.bash_profile" <<'EOF'
+
+# leanerVM: elan and cargo
+export PATH="$HOME/.elan/bin:$HOME/.cargo/bin:$PATH"
+EOF
+fi
+done_step
+
+# lean_vm's manifest is a superset of the other projects' (same revisions). Its packages are
+# fetched once; the other projects are seeded from them before Lake checks them against their own
+# manifests, so they skip the clones and the cache download. Mathlib (7 GB with its cache) is
+# hard-linked, as nothing writes into it; the packages built from source are copied, since each
+# project builds them in its own `.lake/packages`.
+step "lean_vm: Lake dependencies and Mathlib's cache"
+(cd lean_vm && lake exe cache get)
+done_step
+
+for project in Statement common lean_xmss lean_sphincs lean_da; do
+  step "$project: Lake dependencies and Mathlib's cache"
+  mkdir -p "$project/.lake/packages"
+  for package in $(python3 -I -c 'import json, sys
+for p in json.load(open(sys.argv[1]))["packages"]:
+    if p["type"] == "git": print(p["name"])' "$project/lake-manifest.json"); do
+    source_dir="lean_vm/.lake/packages/$package"
+    target_dir="$project/.lake/packages/$package"
+    if [ ! -e "$target_dir" ] && [ -d "$source_dir" ]; then
+      if [ "$package" = mathlib ]; then
+        cp -al "$source_dir" "$target_dir"
+      else
+        cp -a "$source_dir" "$target_dir"
+      fi
+    fi
+  done
+  (cd "$project" && lake exe cache get)
+  done_step
+done
+
+step "leanVM at leanvm-rev in .leanvm, and its Rust dependencies"
+./leanvm-tree.sh
+for manifest in lean_vm/scripts/guest-export/Cargo.toml lean_vm/scripts/rust-verifier-cli/Cargo.toml; do
+  cargo fetch --quiet --manifest-path "$manifest"
+done
+done_step
+
+echo
+echo "leanerVM setup complete in ${SECONDS}s ($root)"
