@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 # Amp orb setup (https://ampcode.com/docs/orbs): the Lean toolchain, every project's Lake
-# dependencies with Mathlib's prebuilt cache, and the Rust toolchain and leanVM checkout that
-# `./check-all.sh vectors` needs. No proof is built here: a build takes CPU-hours (README.md).
-# Idempotent; a warm run only checks what is already installed.
+# dependencies with Mathlib's prebuilt cache, the Rust toolchain and leanVM checkout that
+# `./check-all.sh vectors` needs, then the dependencies Mathlib's cache does not cover and the
+# statement package, built once for all six projects. The proofs are not built: a build takes
+# CPU-hours (README.md). Idempotent; a warm run only checks what is already installed and built.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 root="$PWD"
+
+# Amp stops setup after 20 minutes and then publishes no snapshot: the builds stop at 15, keep what
+# they have built, and the next setup goes on from there.
+build_deadline=900
 
 step() { printf '\n==> %s\n' "$*"; step_start=$SECONDS; }
 done_step() { printf '    (%ds)\n' "$((SECONDS - step_start))"; }
@@ -41,31 +46,47 @@ fi
 done_step
 
 # lean_vm's manifest is a superset of the other projects' (same revisions). Its packages are
-# fetched once; the other projects are seeded from them before Lake checks them against their own
-# manifests, so they skip the clones and the cache download. Mathlib (7 GB with its cache) is
-# hard-linked, as nothing writes into it; the packages built from source are copied, since each
-# project builds them in its own `.lake/packages`.
+# fetched once; the other projects are seeded from them, so they skip the clones and Mathlib's
+# cache. Mathlib (7 GB with its build) is hard-linked: git and leantar replace a file rather than
+# write into it, so an update in one project leaves the others' links alone. The packages built from
+# source are copied (their builds are shared through Lake's artifact cache, below).
 step "lean_vm: Lake dependencies and Mathlib's cache"
 (cd lean_vm && lake exe cache get)
 done_step
 
-for project in Statement common lean_xmss lean_sphincs lean_da; do
-  step "$project: Lake dependencies and Mathlib's cache"
-  mkdir -p "$project/.lake/packages"
-  for package in $(python3 -I -c 'import json, sys
+git_packages() {
+  python3 -I -c 'import json, sys
 for p in json.load(open(sys.argv[1]))["packages"]:
-    if p["type"] == "git": print(p["name"])' "$project/lake-manifest.json"); do
+    if p["type"] == "git": print(p["name"], p["rev"])' "$1/lake-manifest.json"
+}
+vm_mathlib_rev="$(git_packages lean_vm | awk '$1 == "mathlib" { print $2 }')"
+for project in Statement common lean_xmss lean_sphincs lean_da; do
+  step "$project: Lake dependencies, seeded from lean_vm's"
+  mkdir -p "$project/.lake/packages"
+  mathlib_rev=
+  while read -r package rev; do
     source_dir="lean_vm/.lake/packages/$package"
     target_dir="$project/.lake/packages/$package"
-    if [ ! -e "$target_dir" ] && [ -d "$source_dir" ]; then
-      if [ "$package" = mathlib ]; then
-        cp -al "$source_dir" "$target_dir"
-      else
-        cp -a "$source_dir" "$target_dir"
+    [ -d "$source_dir" ] || continue
+    if [ "$package" = mathlib ]; then
+      mathlib_rev="$rev"
+      [ "$rev" = "$vm_mathlib_rev" ] || continue
+      # After a bump lean_vm's Mathlib has moved on: link it again, or Lake would check out the
+      # new sources over this copy's old build.
+      if [ -e "$target_dir" ] \
+        && [ "$(git -C "$target_dir" rev-parse HEAD)" != "$(git -C "$source_dir" rev-parse HEAD)" ]; then
+        rm -rf "$target_dir"
       fi
+      [ -e "$target_dir" ] || cp -al "$source_dir" "$target_dir"
+    elif [ ! -e "$target_dir" ]; then
+      cp -a "$source_dir" "$target_dir"
     fi
-  done
-  (cd "$project" && lake exe cache get)
+  done < <(git_packages "$project")
+  if [ "$mathlib_rev" = "$vm_mathlib_rev" ]; then
+    (cd "$project" && lake env true)  # resolves the workspace; Mathlib's build came with the link
+  else
+    (cd "$project" && lake exe cache get)
+  fi
   done_step
 done
 
@@ -74,6 +95,94 @@ step "leanVM at leanvm-rev in .leanvm, and its Rust dependencies"
 for manifest in lean_vm/scripts/guest-export/Cargo.toml lean_vm/scripts/rust-verifier-cli/Cargo.toml; do
   cargo fetch --quiet --manifest-path "$manifest"
 done
+done_step
+
+# A build that fails or runs out of time is reported, not fatal: what it built stays, and a setup
+# that fails publishes no snapshot.
+build() {
+  local left=$((build_deadline - SECONDS)) code=0
+  if [ "$left" -le 0 ]; then
+    echo "    skipped: setup has run ${SECONDS}s; the next setup builds it"
+    return
+  fi
+  timeout --kill-after=30 "$left" "$@" || code=$?
+  if [ "$code" -eq 124 ] || [ "$code" -eq 137 ]; then
+    echo "    stopped after ${left}s; the next setup goes on from here"
+  elif [ "$code" -ne 0 ]; then
+    echo "    failed (exit $code); the projects' own builds will report it"
+  fi
+}
+
+# The source-built packages (VCVio, CompPoly, PolyFun, cslib, ArkLib, Clean, ...): the modules the
+# six projects import from them, with what those import, built once in lean_vm with Lake's artifact
+# cache writable (`~/.elan/toolchains/<toolchain>/lake/cache`). The cache is keyed by each module's
+# inputs; a project's own `lake build` reads it by default and hard-links the very same files, so
+# the six projects share one build of each module (the importers' traces hash the `.olean` bytes,
+# which two builds need not reproduce). Nothing else writes the cache: `LAKE_ARTIFACT_CACHE` is set
+# here only, and the projects' own modules are never stored in it.
+step "The source-built dependencies, once for all six projects"
+mapfile -t dependency_targets < <(python3 -I - <<'EOF'
+import json, os, re
+from pathlib import Path
+IMPORT = re.compile(r"^(?:(?:public|private)\s+)?(?:meta\s+)?import\s+(?:all\s+)?([\w.«»']+)", re.M)
+packages = Path("lean_vm/.lake/packages")
+cached = {"mathlib"} | {p["name"] for p in json.loads((packages / "mathlib/lake-manifest.json").read_text())["packages"]}
+sources = [d for d in packages.iterdir() if d.name not in cached]
+modules = set()
+for project in ("Statement", "common", "lean_vm", "lean_xmss", "lean_sphincs", "lean_da"):
+    for root, dirs, names in os.walk(project):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for name in names:
+            if name.endswith(".lean"):
+                modules.update(IMPORT.findall((Path(root) / name).read_text(encoding="utf-8")))
+for module in sorted(modules):
+    path = Path(*module.split(".")).with_suffix(".lean")
+    if any((d / path).is_file() for d in sources):
+        print("+" + module)
+EOF
+)
+echo "    ${#dependency_targets[@]} modules imported from them"
+LAKE_ARTIFACT_CACHE=true build python3 -I lake-build.py lean_vm "${dependency_targets[@]}"
+done_step
+
+# Every project imports the statement package, built in `Statement/.lake/build` for all of them.
+step "Statement, as CI builds it"
+build python3 -I lake-build.py Statement
+done_step
+
+step "Orb notes for agents in ~/.config/amp/AGENTS.md"
+python3 -I - "$HOME/.config/amp/AGENTS.md" <<'EOF'
+import os, sys
+from pathlib import Path
+begin, end = "<!-- leanerVM orb notes: begin -->", "<!-- leanerVM orb notes: end -->"
+block = f"""{begin}
+## leanerVM in this orb
+
+- `.agents/setup` built the modules the projects import from the source-built packages (VCVio, CompPoly, PolyFun, cslib, ArkLib, Clean) into Lake's artifact cache, `~/.elan/toolchains/<toolchain>/lake/cache`, and built `Statement`. A project's `lake build` restores those modules from the cache as hard links in seconds. Leave `LAKE_ARTIFACT_CACHE` unset: set to `true`, it stores every module built, the projects' own included, in that cache, which nothing cleans.
+- `lake-build.py` cannot make its systemd scope in an orb (no permission for a system scope, no user bus) and says so; its memory budget admits the modules, and the orb's `amp-workload.slice` caps the memory of everything run from Amp.
+- An orb pauses while its thread is idle, and processes started from the shell stop: run a long build (`./check-all.sh`, `lake-build.py lean_vm ...`) as a supervised service (`amp orb service start <name> --command '...'`) and poll its log.
+{end}
+"""
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8") if path.exists() else ""
+if begin in text:
+    start = text.index(begin)
+    stop = text.find(end, start)
+    if stop < 0:  # never delete text that cannot be identified
+        print(f"    warning: {path} has {begin!r} without {end!r}; left as it is")
+        sys.exit(0)
+    stop += len(end)
+    if text[stop:stop + 1] == "\n":
+        stop += 1
+    new = text[:start] + block + text[stop:]
+else:
+    new = text + ("\n" if text and not text.endswith("\n") else "") + ("\n" if text else "") + block
+if new != text:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(new, encoding="utf-8")
+    os.replace(tmp, path)
+EOF
 done_step
 
 echo
