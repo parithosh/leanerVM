@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Amp orb resume (https://ampcode.com/docs/orbs): runs after activation and every wake, in seconds.
+set -euo pipefail
+
+# lean_vm's end file (`LeanVM.lean`) maps some 14,000 modules' `.olean`s, beyond the kernel's
+# default of 65,530 memory maps: it then fails with "failed to read file ….olean.private". A kernel
+# setting, so it is set here rather than in the snapshot.
+want=1048576
+if [ "$(cat /proc/sys/vm/max_map_count)" -lt "$want" ]; then
+  echo "$want" | sudo -n tee /proc/sys/vm/max_map_count > /dev/null
+fi
